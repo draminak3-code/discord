@@ -1,0 +1,180 @@
+version: "3.9"
+
+# =============================================================================
+# Discord Clone — Distributed Runtime Environment
+# Hybrid architecture: REST API + WebSocket Gateway (single backend service),
+# PostgreSQL (transactional data), Redis (ephemeral state + Pub/Sub fan-out),
+# MinIO (S3-compatible media storage), Nginx (reverse proxy for /api and /ws).
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Reverse Proxy — single entrypoint on :8080 (map to 80/443 in production)
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: discord-nginx
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+      # - "8443:443"   # enable with Let's Encrypt certificates
+    volumes:
+      - ./nginx/http-zones.conf:/etc/nginx/conf.d/00-http-zones.conf:ro
+      - ./nginx/upstreams.conf:/etc/nginx/conf.d/upstreams.conf:ro
+      - ./nginx/proxy-common.inc:/etc/nginx/conf.d/proxy-common.inc:ro
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      frontend:
+        condition: service_started
+      backend:
+        condition: service_healthy
+    networks:
+      - discord-net
+    # For automatic TLS, also run:
+    #   docker run -d --restart=always \
+    #     -v /var/run/docker.sock:/tmp/docker.sock:ro \
+    #     --network discord-net jrcs/letsencrypt-nginx-proxy-companion
+    labels:
+      - "com.docker.proxy.host=localhost"
+
+  # ---------------------------------------------------------------------------
+  # Frontend — React (Vite build) served statically by nginx
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: discord-frontend
+    restart: unless-stopped
+    expose:
+      - "3000"
+    networks:
+      - discord-net
+
+  # ---------------------------------------------------------------------------
+  # Backend — Node.js: Express REST API + ws WebSocket Gateway (opcodes 0-11)
+  # Stateless & horizontally scalable; shares state via Redis pub/sub.
+  # ---------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: discord-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      DATABASE_URL: postgres://discord:${POSTGRES_PASSWORD}@database:5432/discord
+      REDIS_URL: redis://cache:6379
+      MINIO_ENDPOINT: http://media-storage:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET:-discord-media}
+    depends_on:
+      database:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      media-storage:
+        condition: service_healthy
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - discord-net
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — ACID store for users/guilds/channels/roles/messages metadata
+  # ---------------------------------------------------------------------------
+  database:
+    image: postgres:16-alpine
+    container_name: discord-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: discord
+      POSTGRES_USER: discord
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/src/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U discord -d discord"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - discord-net
+
+  # ---------------------------------------------------------------------------
+  # Redis — ephemeral state (presence/typing/read-receipts) + Pub/Sub bus
+  # Channels: channel:<id>, guild:<id>, user:<id>
+  # ---------------------------------------------------------------------------
+  cache:
+    image: redis:7-alpine
+    container_name: discord-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - discord-net
+
+  # ---------------------------------------------------------------------------
+  # MinIO — S3-compatible object storage. Media uploads go DIRECTLY here
+  # (presigned PUT), never through the message servers / WebSocket gateway.
+  # ---------------------------------------------------------------------------
+  media-storage:
+    image: minio/minio:latest
+    container_name: discord-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    ports:
+      - "9001:9001"          # web console (dev only)
+    expose:
+      - "9000"               # S3 API (internal)
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - discord-net
+
+  # ---------------------------------------------------------------------------
+  # Optional voice/video SFU layer (Mediasoup) — uncomment to enable WebRTC
+  # signaling integration with the gateway (see docs/TECH_PROMPT.md §4.4).
+  # ---------------------------------------------------------------------------
+  # mediasoup-sfu:
+  #   build: ./sfu
+  #   container_name: discord-sfu
+  #   restart: unless-stopped
+  #   expose: ["3000"]
+  #   ports: ["40000-40010:40000-40010/udp"]   # RTP/RTCP port range
+  #   networks: [discord-net]
+
+networks:
+  discord-net:
+    driver: bridge
+    name: discord-net
+
+volumes:
+  pgdata:
+  miniodata:
